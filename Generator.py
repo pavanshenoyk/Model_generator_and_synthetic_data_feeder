@@ -4,9 +4,9 @@ import time
 import torch
 import torch.nn.functional as F
 import pandas as pd
-from openai import OpenAI
-from models.decoder_only import Transformer as Decoder_only
-from agents.Agent import agent
+import openai
+from TransformerAgentModels.models import decoder_only as Decoder_only
+from TransformerAgentModels.agent import agent
 
 basic_config = {
     "location": os.getcwd(),
@@ -43,7 +43,7 @@ data_config = {
 MODEL_ARGS = dict(d_model=256, d_ff=1024, head=8, seq_length=256, dropout=0.1, num_layers=4)
 
 # NOTE : declare OPENAI_API_KEY as an environment variable before executing code
-_client = OpenAI()
+_client = openai.OpenAI()
 def call_teacher(k, incomplete):
     text = (
         f"{gpt_config['prompt']}\n\n"
