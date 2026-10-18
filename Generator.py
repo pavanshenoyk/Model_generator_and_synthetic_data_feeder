@@ -8,25 +8,32 @@ import openai
 from TransformerAgentModels.models import decoder_only as Decoder_only
 from TransformerAgentModels.agent import agent
 
+#the above thing is temporary
 basic_config = {
     "location": os.getcwd(),
     "model_name": "",
     "model_type": "decoder_only",
     "file": "",
     "file_id": None, 
-    "count": 1} 
+    "count": 1,
+    "data_splitter":"==="} 
 
 gpt_config = {
     "model": "gpt-6-luna",
     "prompt": "",
+    "api_key": os.environ.get('OPENAI_API_KEY'),
+    "reasoning_effort": "low",      # try "none" to cut cost; verify allowed values in the docs
+    "max_output_tokens": 32000,     # must fit examples_per_call examples plus any reasoning tokens
+    "spend_cap_usd": 10.0,          # hard stop, raise it whenever you want
+    "price_in": 0.10,               # $ per 1M input tokens
+    "price_out": 0.50,              # $ per 1M output tokens
     "accuracy_threshold": 80.0,
     "required_successes": 2}
 
 train_test_config = {
-    "train_examples": 32,
-    "test_examples": 8,
-    "examples_per_call": 8,
-    "incomplete_ratio": 0.2
+    "train_examples": 1024,
+    "test_examples": 32,
+    "examples_per_call": 32
 }
 
 data_config = {
@@ -34,7 +41,6 @@ data_config = {
     "epochs_per_cycle": 1,
     "lr": 3e-4,
     "grad_clip": 1.0,
-
     "checkpoint_hours": 1,
     "halt_hours": 12
 }
@@ -42,20 +48,27 @@ data_config = {
 # placeholder sizes -- tune for your GPU
 MODEL_ARGS = dict(d_model=256, d_ff=1024, head=8, seq_length=256, dropout=0.1, num_layers=4)
 
-# NOTE : declare OPENAI_API_KEY as an environment variable before executing code
-_client = openai.OpenAI()
-def call_teacher(k, incomplete):
+_client = openai.OpenAI(api_key=gpt_config["api_key"])
+
+spend = {"in": 0, "out": 0}
+
+
+def track_spend(response):
+    """Accumulate token usage, print running cost, stop if the cap is hit."""
+    u = response.usage
+    spend["in"] += u.input_tokens
+    spend["out"] += u.output_tokens
+    cost = (spend["in"] * gpt_config["price_in"] + spend["out"] * gpt_config["price_out"]) / 1e6
+    print(f"  teacher spend so far: ${cost:.3f}")
+    if cost >= gpt_config["spend_cap_usd"]:
+        raise RuntimeError(f"Spend cap of ${gpt_config['spend_cap_usd']} reached, stopping")
+
+
+def call_teacher(k):
     text = (
         f"{gpt_config['prompt']}\n\n"
-        f"Generate {k} different examples in the same format as the attached samples. "
-        "Put a line containing only === between examples and output nothing else."
+        f"Generate {k} different examples.\n\n"
     )
-    if incomplete:
-        text += (
-            " In every example, deliberately leave out some of the information in the input "
-            "(for example missing details or sections), while keeping the example realistic "
-            "and the output sensible for the information that IS given."
-        )
 
     if basic_config["file_id"] is None:
         with open(basic_config["file"], "rb") as f:
@@ -63,6 +76,8 @@ def call_teacher(k, incomplete):
 
     response = _client.responses.create(
         model=gpt_config["model"],
+        reasoning={"effort": gpt_config["reasoning_effort"]},
+        max_output_tokens=gpt_config["max_output_tokens"],
         input=[{
             "role": "user",
             "content": [
@@ -71,19 +86,35 @@ def call_teacher(k, incomplete):
             ],
         }],
     )
-    return response.output_text
+    track_spend(response)
+    out=response.output_text
+    if response.status == "incomplete":
+        print("Warning: teacher output was truncated, last example may be cut off")
+        out = out.rsplit(f"\n{basic_config['data_splitter']}", 1)[0] if f"\n{basic_config['data_splitter']}" in out else out
+    return out
 
 
 def parse_examples(text):
-    parts = re.split(r"^\s*===\s*$", text, flags=re.MULTILINE)
+    pattern = rf"^\s*{re.escape(basic_config['data_splitter'])}\s*$"
+    parts = re.split(pattern, text, flags=re.MULTILINE)
     return [p.strip() for p in parts if p.strip()]
 
 
-def collect(count, incomplete):
+def save_sample(ex,save):
+    """Append one accepted training example to training_sample/<model_name>.txt."""
+    if save=="training":directory = os.path.join(basic_config["location"], "training_sample")
+    else: directory = os.path.join(basic_config["location"], "testing_sample")
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, f"{basic_config['model_name']}.txt")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(ex + f"\n{basic_config['data_splitter']}\n") 
+
+
+def collect(count, save):
     examples, misses = [], 0
     while len(examples) < count:
         k = min(train_test_config["examples_per_call"], count - len(examples))
-        got = parse_examples(call_teacher(k, incomplete))[:k]
+        got = parse_examples(call_teacher(k))[:k]
         if not got:
             misses += 1
             if misses >= 3:
@@ -91,16 +122,19 @@ def collect(count, incomplete):
             continue
         misses = 0
         examples.extend(got)
+        
+        for ex in got:
+            save_sample(ex,save)
     return examples
 
 
 def generate_data(kind):
     if kind == "testing":
-        return collect(train_test_config["test_examples"], incomplete=False)
+        return collect(train_test_config["test_examples"], save=kind)
 
     n = train_test_config["train_examples"]
-    n_incomplete = int(n * train_test_config["incomplete_ratio"])
-    return collect(n - n_incomplete, incomplete=False) + collect(n_incomplete, incomplete=True)
+    return collect(n, save=kind)
+            
 
 
 
@@ -108,6 +142,7 @@ def log(data,action):
     if action == "training": folder="training_history"
     else: folder="testing_history"
     directory = os.path.join(basic_config["location"],folder)
+    os.makedirs(directory, exist_ok=True)
 
     file_path = os.path.join(directory, f"{basic_config['model_name']}_{action}_log.csv")
 
@@ -117,10 +152,6 @@ def log(data,action):
     else:
         df.to_csv(file_path, index=False)
 
-
-# ---------------------------------------------------------------------------
-# train / test
-# ---------------------------------------------------------------------------
 
 def make_windows(model, examples, shuffle=False):
     """Tokenize examples (EOS-terminated), pack into one stream, cut into
